@@ -12,7 +12,6 @@ from datetime import datetime, date, timedelta
 from typing import Any, Optional
 
 import pandas as pd
-import plotly.express as px
 import plotly.graph_objects as go
 import requests
 import streamlit as st
@@ -65,7 +64,6 @@ st.markdown(
         color: {TEXT};
     }}
 
-    /* Hide default Streamlit chrome */
     #MainMenu, footer, header {{visibility: hidden;}}
     .block-container {{padding-top: 1.6rem; padding-bottom: 3rem; max-width: 1500px;}}
 
@@ -633,7 +631,6 @@ def page_explorer(filters: dict):
         return
 
     df = pd.DataFrame(items)
-    # Display-ready frame
     display = pd.DataFrame({
         "Account ID":   df.get("account_id"),
         "Creditor":     df.get("creditor"),
@@ -666,7 +663,6 @@ def page_explorer(filters: dict):
         height=min(700, 60 + 42 * len(display)),
     )
 
-    # ── Pagination ────────────────────────────────────────────────
     c1, c2, c3 = st.columns([1, 3, 1])
     with c1:
         if st.button("← Previous", disabled=params["page"] <= 1, use_container_width=True):
@@ -685,7 +681,6 @@ def page_explorer(filters: dict):
 
     panel_close()
 
-    # ── Quick distribution for the current filter ─────────────────
     panel_open()
     section("Filtered distribution",
             "Probability spread of the currently matched accounts")
@@ -731,7 +726,6 @@ def page_details():
 
     pred, perr = api_get(f"/api/accounts/{account_id}/prediction")
 
-    # ── Header block ─────────────────────────────────────────────
     panel_open()
     st.markdown(
         f"""
@@ -761,7 +755,6 @@ def page_details():
     )
     panel_close()
 
-    # ── KPI row ──────────────────────────────────────────────────
     k1, k2, k3, k4 = st.columns(4, gap="medium")
     with k1:
         metric_card("Original balance",
@@ -788,7 +781,6 @@ def page_details():
 
     st.markdown("<div style='height:22px'></div>", unsafe_allow_html=True)
 
-    # ── Prediction panel ─────────────────────────────────────────
     left, right = st.columns([1, 1.3], gap="large")
 
     with left:
@@ -896,7 +888,6 @@ def page_details():
                 )
         panel_close()
 
-    # ── Full record ──────────────────────────────────────────────
     panel_open()
     section("Raw record", "Everything returned by the backend")
     raw = pd.DataFrame([detail]).T.reset_index()
@@ -933,7 +924,6 @@ def page_settings():
             format="%.2f",
         )
 
-        # Visual impact preview
         preview = go.Figure(go.Indicator(
             mode="number+delta",
             value=new_val,
@@ -1031,16 +1021,13 @@ def page_settings():
 # 11. ROUTER
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
-    # Init session state
     st.session_state.setdefault("explorer_page", 1)
     st.session_state.setdefault("_online", None)
 
-    # Sidebar returns current page + filters
     ctx = sidebar()
     page = ctx["page"]
     filters = ctx["filters"]
 
-    # Reset explorer page when filters change
     if page == "Accounts Explorer":
         fp = tuple(str(v) for v in filters.values())
         if st.session_state.get("_last_filter_key") != fp:
