@@ -1,18 +1,14 @@
 # app.py — Statute-Barred Debt Predictor — Advanced Edition
-# Streamlit frontend for the sklearn bundle pickle. No TensorFlow.
-#   Pages:  Overview · Predict · Batch · Explorer · Insights · Settings
-#   Bonus:  Demo mode with guided callouts for presenting.
+# Streamlit frontend for the sklearn bundle pickle.
+# Handles samples with OR without the target column.
 
 from __future__ import annotations
 
-from datetime import datetime
 from pathlib import Path
-from typing import Any
 
 import joblib
 import numpy as np
 import pandas as pd
-import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 from sklearn.inspection import permutation_importance
@@ -32,6 +28,10 @@ MODEL_CANDIDATES = [
     "statute_barred_model(1).pkl",
 ]
 DATA_PATH = BASE / "accounts_sample.parquet"
+
+# Names we'll accept for the target column
+TARGET_CANDIDATES = ["IsStatBarred", "is_stat_barred", "STAT_BARRED",
+                     "target", "Target", "label", "y"]
 
 NAVY_BG  = "#070b16"; PANEL_BG = "#0f1729"; PANEL_2 = "#141d33"
 BORDER   = "rgba(120,150,200,0.18)"
@@ -135,6 +135,14 @@ html, body, [class*="css"] {{ font-family:'Inter', system-ui, sans-serif; }}
 }}
 .demo-tip b {{color:#ffecb8;}}
 
+.notice {{
+  padding:14px 18px; border-radius:12px; margin:0 0 14px;
+  background:linear-gradient(90deg, rgba(56,224,196,.10), rgba(56,224,196,.03));
+  border:1px solid rgba(56,224,196,.30);
+  color:{TEAL}; font-size:12.5px; line-height:1.6;
+}}
+.notice b {{color:{TEXT};}}
+
 section[data-testid="stSidebar"] {{
   background:linear-gradient(180deg,#0a1226 0%,#0c1428 100%);
   border-right:1px solid {BORDER};
@@ -201,6 +209,14 @@ def load_sample() -> pd.DataFrame:
     return pd.read_parquet(DATA_PATH)
 
 
+def detect_target_col(df: pd.DataFrame) -> str | None:
+    """Return the first matching target column name, else None."""
+    for cand in TARGET_CANDIDATES:
+        if cand in df.columns:
+            return cand
+    return None
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # PREPROCESSING
 # ─────────────────────────────────────────────────────────────────────────────
@@ -249,22 +265,22 @@ def predict_proba(df_raw: pd.DataFrame, bundle: dict) -> np.ndarray:
 
 
 def explain_row(row: pd.Series, bundle: dict, base_prob: float, top_k: int = 8) -> pd.DataFrame:
-    """Local ablation: replace each feature with its median/mode, measure Δp."""
+    """Ablation-based local explanation: replace each feature with its median/mode, measure Δp."""
     df = pd.DataFrame([row])
     effects = []
 
-    num_cols = bundle["numerical_cols"]
-    cat_cols = bundle["onehot_cols"]
-
-    for col in num_cols:
+    for col in bundle["numerical_cols"]:
         if col not in df.columns:
             continue
-        med = bundle["train_medians"].get(col, df[col].iloc[0])
         if pd.isna(df[col].iloc[0]):
             continue
+        med = bundle["train_medians"].get(col, df[col].iloc[0])
         trial = df.copy()
         trial[col] = med
-        new_p = float(predict_proba(trial, bundle)[0])
+        try:
+            new_p = float(predict_proba(trial, bundle)[0])
+        except Exception:
+            continue
         effects.append({
             "feature": col,
             "value": row.get(col),
@@ -272,12 +288,15 @@ def explain_row(row: pd.Series, bundle: dict, base_prob: float, top_k: int = 8) 
             "delta": base_prob - new_p,
         })
 
-    for col in cat_cols:
+    for col in bundle["onehot_cols"]:
         if col not in df.columns:
             continue
         trial = df.copy()
         trial[col] = "MISSING"
-        new_p = float(predict_proba(trial, bundle)[0])
+        try:
+            new_p = float(predict_proba(trial, bundle)[0])
+        except Exception:
+            continue
         effects.append({
             "feature": col,
             "value": row.get(col),
@@ -286,9 +305,12 @@ def explain_row(row: pd.Series, bundle: dict, base_prob: float, top_k: int = 8) 
         })
 
     out = pd.DataFrame(effects)
+    if out.empty:
+        return out
     out["abs_delta"] = out["delta"].abs()
-    out = out.sort_values("abs_delta", ascending=False).head(top_k).drop(columns="abs_delta")
-    return out
+    return (out.sort_values("abs_delta", ascending=False)
+               .head(top_k)
+               .drop(columns="abs_delta"))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -326,10 +348,14 @@ def panel_open(): st.markdown('<div class="panel">', unsafe_allow_html=True)
 def panel_close(): st.markdown('</div>', unsafe_allow_html=True)
 
 
-def demo_tip(text: str, key: str = ""):
+def demo_tip(text: str):
     if st.session_state.get("demo_mode"):
         st.markdown(f'<div class="demo-tip">🎬 <b>Demo:</b> {text}</div>',
                     unsafe_allow_html=True)
+
+
+def notice(html: str):
+    st.markdown(f'<div class="notice">{html}</div>', unsafe_allow_html=True)
 
 
 def style_fig(fig, height=340):
@@ -365,6 +391,11 @@ if SAMPLE.empty:
 
 THRESHOLD = float(BUNDLE.get("threshold", 0.5))
 
+# Detect target column once
+TARGET_COL = detect_target_col(SAMPLE)
+HAS_TARGET = TARGET_COL is not None
+
+# Score the sample once
 if "scored_df" not in st.session_state:
     with st.spinner("Scoring portfolio…"):
         probs = predict_proba(SAMPLE, BUNDLE)
@@ -374,44 +405,54 @@ if "scored_df" not in st.session_state:
 
 DF = st.session_state["scored_df"].copy()
 
-# Cached diagnostics (fit once per session)
+# Diagnostics — only if target exists
 if "diag" not in st.session_state:
-    y_true = DF["IsStatBarred"].astype(int).values
-    y_prob = DF["_prob"].values
-    y_pred = (y_prob >= THRESHOLD).astype(int)
+    if not HAS_TARGET:
+        st.session_state["diag"] = None
+    else:
+        try:
+            y_raw = DF[TARGET_COL]
+            # Handle both 0/1 ints and N/Y strings
+            if y_raw.dtype == object or y_raw.dtype.name == "category":
+                y_true = y_raw.map({"N": 0, "Y": 1, "n": 0, "y": 1,
+                                    1: 1, 0: 0, True: 1, False: 0}).astype(int).values
+            else:
+                y_true = y_raw.astype(int).values
 
-    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
-    fpr, tpr, _ = roc_curve(y_true, y_prob)
+            y_prob = DF["_prob"].values
+            y_pred = (y_prob >= THRESHOLD).astype(int)
 
-    # Threshold sweep (precision/recall/f1 vs threshold)
-    thresholds = np.linspace(0.05, 0.95, 40)
-    sweep = []
-    for t in thresholds:
-        pred = (y_prob >= t).astype(int)
-        if pred.sum() == 0:
-            continue
-        sweep.append({
-            "threshold": float(t),
-            "precision": precision_score(y_true, pred, zero_division=0),
-            "recall":    recall_score(y_true, pred, zero_division=0),
-            "f1":        f1_score(y_true, pred, zero_division=0),
-            "flagged":   int(pred.sum()),
-        })
-    sweep_df = pd.DataFrame(sweep)
+            cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+            fpr, tpr, _ = roc_curve(y_true, y_prob)
 
-    st.session_state["diag"] = {
-        "cm": cm,
-        "fpr": fpr,
-        "tpr": tpr,
-        "auc": float(roc_auc_score(y_true, y_prob)),
-        "acc": float(accuracy_score(y_true, y_pred)),
-        "precision": float(precision_score(y_true, y_pred, zero_division=0)),
-        "recall": float(recall_score(y_true, y_pred, zero_division=0)),
-        "f1": float(f1_score(y_true, y_pred, zero_division=0)),
-        "sweep": sweep_df,
-    }
+            thresholds = np.linspace(0.05, 0.95, 40)
+            sweep = []
+            for t in thresholds:
+                pred = (y_prob >= t).astype(int)
+                if pred.sum() == 0:
+                    continue
+                sweep.append({
+                    "threshold": float(t),
+                    "precision": precision_score(y_true, pred, zero_division=0),
+                    "recall":    recall_score(y_true, pred, zero_division=0),
+                    "f1":        f1_score(y_true, pred, zero_division=0),
+                    "flagged":   int(pred.sum()),
+                })
 
-DIAG = st.session_state["diag"]
+            st.session_state["diag"] = {
+                "cm": cm, "fpr": fpr, "tpr": tpr,
+                "auc":       float(roc_auc_score(y_true, y_prob)),
+                "acc":       float(accuracy_score(y_true, y_pred)),
+                "precision": float(precision_score(y_true, y_pred, zero_division=0)),
+                "recall":    float(recall_score(y_true, y_pred, zero_division=0)),
+                "f1":        float(f1_score(y_true, y_pred, zero_division=0)),
+                "sweep":     pd.DataFrame(sweep),
+            }
+        except Exception as e:
+            st.session_state["diag"] = None
+            st.session_state["diag_error"] = str(e)
+
+DIAG = st.session_state.get("diag")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -451,6 +492,7 @@ def sidebar():
             st.session_state["scored_df"]["_pred"] = (
                 st.session_state["scored_df"]["_prob"] >= new_t
             ).astype(int)
+            st.session_state.pop("diag", None)   # invalidate so it recomputes
             st.rerun()
 
         st.markdown("---")
@@ -460,12 +502,20 @@ def sidebar():
             st.caption("Guided callouts appear throughout the app.")
 
         st.markdown("---")
+
+        diag_line = ""
+        if DIAG is not None:
+            diag_line = (f"<div style='color:{MUTED};font-size:11px;'>"
+                         f"AUC {DIAG['auc']:.3f} · Acc {DIAG['acc']*100:.1f}%</div>")
+        else:
+            diag_line = (f"<div style='color:{MUTED};font-size:11px;'>"
+                         f"Diagnostics unavailable</div>")
+
         st.markdown(
             f"<div style='color:{GREEN};font-weight:600;font-size:12.5px;'>● Model loaded</div>"
             f"<div style='color:{MUTED};font-size:11px;margin-top:4px;'>"
             f"{len(SAMPLE):,} accounts · {type(BUNDLE['model']).__name__}</div>"
-            f"<div style='color:{MUTED};font-size:11px;'>"
-            f"AUC {DIAG['auc']:.3f} · Acc {DIAG['acc']*100:.1f}%</div>",
+            + diag_line,
             unsafe_allow_html=True,
         )
 
@@ -478,13 +528,13 @@ def sidebar():
 def page_overview():
     hero("Predict Statute-Barred Debt with Deep Learning",
          "Identify time-barred accounts and optimize collection strategy.")
-    demo_tip("Start here. Show KPIs → then hover the histogram → then the creditor chart.")
+    demo_tip("Start here. Show the KPIs, hover the histogram, then the creditor chart.")
 
     total   = len(DF)
     barred  = int((DF["_prob"] >= THRESHOLD).sum())
     rate    = barred / total if total else 0
     high    = int((DF["_prob"] >= 0.80).sum())
-    balance = float(DF["CurrentBalance"].sum())
+    balance = float(DF["CurrentBalance"].sum()) if "CurrentBalance" in DF.columns else 0.0
     recover = balance * (1 - rate) * 0.35
 
     c1, c2, c3, c4 = st.columns(4, gap="medium")
@@ -587,28 +637,28 @@ def page_overview():
 # ─────────────────────────────────────────────────────────────────────────────
 def page_predict():
     hero("Live Prediction", "Score a single account interactively.", "Real-time inference")
-    demo_tip("Fill the form or click 'Random sample' → hit Predict → show the gauge + local explanation.")
+    demo_tip("Click 'Random sample' → hit Predict → show the gauge + local explanation.")
 
     left, right = st.columns([1.2, 1], gap="large")
 
     with left:
         panel_open()
-        section("Account details", "Every field is optional — defaults fill in automatically")
+        section("Account details", "Every field is editable — defaults fill in automatically")
 
-        col_a, col_b = st.columns([2, 1])
-        with col_a:
+        c1, c2 = st.columns([2, 1])
+        with c1:
             st.caption("Or load a random account from the sample to auto-fill")
-        with col_b:
+        with c2:
             if st.button("🎲 Random sample", use_container_width=True):
                 row = DF.sample(1).iloc[0]
                 for col in DF.columns:
-                    if col.startswith("_"):
+                    if col.startswith("_") or col == TARGET_COL:
                         continue
                     st.session_state[f"inp_{col}"] = row[col]
                 st.rerun()
 
-        cols = list(DF.columns)
-        input_cols = [c for c in cols if not c.startswith("_") and c != "IsStatBarred"]
+        input_cols = [c for c in DF.columns
+                      if not c.startswith("_") and c != TARGET_COL]
 
         with st.form("predict_form", clear_on_submit=False):
             values = {}
@@ -616,21 +666,20 @@ def page_predict():
             for i, col in enumerate(input_cols):
                 target = g1 if i % 2 == 0 else g2
                 key = f"inp_{col}"
-                sample_val = DF[col].iloc[0]
-                default = st.session_state.get(key, sample_val)
+                default = st.session_state.get(key, DF[col].iloc[0])
                 with target:
                     if pd.api.types.is_numeric_dtype(DF[col]):
-                        values[col] = st.number_input(
-                            col,
-                            value=float(default) if pd.notna(default) else 0.0,
-                            step=1.0 if "Num" in col or "Age" in col or "Parties" in col else 0.01,
-                            key=key,
-                        )
+                        safe_default = float(default) if pd.notna(default) else 0.0
+                        step = (1.0 if any(k in col for k in ("Num", "Age", "Parties", "ID"))
+                                else 0.01)
+                        values[col] = st.number_input(col, value=safe_default,
+                                                      step=step, key=key)
                     else:
                         options = sorted(DF[col].dropna().astype(str).unique())
-                        if default not in options and pd.notna(default):
-                            options = [str(default)] + options
-                        idx = options.index(str(default)) if str(default) in options else 0
+                        d_str = str(default)
+                        if d_str not in options and pd.notna(default):
+                            options = [d_str] + options
+                        idx = options.index(d_str) if d_str in options else 0
                         values[col] = st.selectbox(col, options, index=idx, key=key)
 
             submitted = st.form_submit_button("Predict →", use_container_width=True)
@@ -642,9 +691,7 @@ def page_predict():
             try:
                 p = float(predict_proba(row_df, BUNDLE)[0])
                 st.session_state["last_prediction"] = {
-                    "input": values,
-                    "prob": p,
-                    "row": row_df.iloc[0],
+                    "input": values, "prob": p, "row": row_df.iloc[0],
                 }
             except Exception as e:
                 st.error(f"Prediction failed: {e}")
@@ -699,20 +746,26 @@ def page_predict():
 
         st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
         with st.expander("🔍 Local explanation (what drove this prediction)"):
-            expl = explain_row(last["row"], BUNDLE, p, top_k=8)
-            fig = go.Figure(go.Bar(
-                x=expl["delta"],
-                y=expl["feature"],
-                orientation="h",
-                marker=dict(color=expl["delta"],
-                            colorscale=[[0, GREEN], [0.5, MUTED], [1, RED]],
-                            cmid=0, line=dict(width=0)),
-                hovertemplate="%{y}<br>Δp = %{x:+.3f}<extra></extra>",
-            ))
-            fig.update_layout(xaxis_title="Δp (positive = pushes toward barred)",
-                              yaxis_title="", showlegend=False,
-                              yaxis=dict(autorange="reversed"))
-            st.plotly_chart(style_fig(fig, 260), use_container_width=True)
+            try:
+                expl = explain_row(last["row"], BUNDLE, p, top_k=8)
+                if expl.empty:
+                    st.info("No feature contributions available.")
+                else:
+                    fig = go.Figure(go.Bar(
+                        x=expl["delta"], y=expl["feature"], orientation="h",
+                        marker=dict(color=expl["delta"],
+                                    colorscale=[[0, GREEN], [0.5, MUTED], [1, RED]],
+                                    cmid=0, line=dict(width=0)),
+                        hovertemplate="%{y}<br>Δp = %{x:+.3f}<extra></extra>",
+                    ))
+                    fig.update_layout(
+                        xaxis_title="Δp (positive = pushes toward barred)",
+                        yaxis_title="", showlegend=False,
+                        yaxis=dict(autorange="reversed"),
+                    )
+                    st.plotly_chart(style_fig(fig, 260), use_container_width=True)
+            except Exception as e:
+                st.warning(f"Explanation unavailable: {e}")
 
         panel_close()
 
@@ -721,8 +774,9 @@ def page_predict():
 # PAGE — BATCH SCORE
 # ─────────────────────────────────────────────────────────────────────────────
 def page_batch():
-    hero("Batch Scoring", "Upload a CSV and score every row with the model.", "Server-side inference")
-    demo_tip("Upload a CSV (any columns) → see how many are flagged → download the scored output.")
+    hero("Batch Scoring", "Upload a CSV and score every row with the model.",
+         "Server-side inference")
+    demo_tip("Upload a CSV → see how many rows are flagged → download the scored output.")
 
     uploaded = st.file_uploader("Upload CSV", type=["csv"])
     if uploaded is None:
@@ -749,16 +803,15 @@ def page_batch():
 
         out = df_in.copy()
         out["statute_barred_probability"] = probs.round(4)
-        out["predicted_is_statute_barred"] = (probs >= THRESHOLD)
+        out["predicted_is_statute_barred"] = probs >= THRESHOLD
         out["risk_band"] = pd.cut(probs, [0, .25, .5, .75, 1.0],
                                   labels=["Low","Medium","High","Critical"],
                                   include_lowest=True).astype(str)
 
         panel_open()
         section("Summary",
-                f"Flagged {int(out['predicted_is_statute_barred'].sum())} of {len(out)} rows "
-                f"at threshold {THRESHOLD:.2f}")
-
+                f"Flagged {int(out['predicted_is_statute_barred'].sum())} of "
+                f"{len(out)} rows at threshold {THRESHOLD:.2f}")
         c1, c2, c3 = st.columns(3)
         with c1: metric_card("Rows scored", f"{len(out):,}", "", TEAL)
         with c2: metric_card("Flagged",
@@ -783,7 +836,7 @@ def page_batch():
 def page_explorer():
     hero("Accounts Explorer", "Filter, sort, and inspect scored accounts.",
          "Live filtering")
-    demo_tip("Narrow the probability range → then search a creditor → click into a row.")
+    demo_tip("Narrow the probability range → search a creditor → inspect a row.")
 
     panel_open()
     f1, f2, f3, f4 = st.columns([2, 1, 1, 1])
@@ -820,7 +873,8 @@ def page_explorer():
     display = pd.DataFrame({
         "Account ID":  rows["AccountID"] if "AccountID" in rows.columns else rows.index.astype(str),
         "Creditor":    rows.get("OriginalCreditor[Redacted]"),
-        "Balance":     rows["CurrentBalance"].apply(lambda v: f"${v:,.2f}"),
+        "Balance":     rows["CurrentBalance"].apply(lambda v: f"${v:,.2f}")
+                       if "CurrentBalance" in rows.columns else "",
         "Status":      rows.get("CollectionStatus"),
         "Age":         rows.get("CustomerAge"),
         "Probability": rows["_prob"].astype(float),
@@ -862,7 +916,21 @@ def page_explorer():
 def page_insights():
     hero("Model Insights", "Diagnostics, threshold tuning, and feature importance.",
          "Evaluation on the sample")
-    demo_tip("This page sells the model. Show the ROC curve → threshold sweep → feature importance.")
+
+    if DIAG is None:
+        notice(
+            "<b>Diagnostics unavailable.</b><br>"
+            "Your <code>accounts_sample.parquet</code> doesn't include the "
+            "<code>IsStatBarred</code> target column (or it uses a name we don't recognize). "
+            "Predictions and every other page work fine — only this diagnostics page needs "
+            "ground-truth labels.<br><br>"
+            "To enable this page, re-run the sample-saving block in <code>train.py</code> "
+            "<b>before</b> dropping the target column, then re-upload the parquet."
+        )
+        demo_tip("Skip this page during the demo and jump to Settings if the target column is missing.")
+        return
+
+    demo_tip("This page sells the model. Show ROC → threshold sweep → feature importance.")
 
     tab1, tab2, tab3, tab4 = st.tabs(
         ["📊 Performance", "🎯 Threshold sweep", "🔬 Feature importance", "🧩 Confusion matrix"]
@@ -876,7 +944,6 @@ def page_insights():
         with c4: metric_card("Recall", f"{DIAG['recall']:.3f}", "Caught of all barred", CORAL)
 
         st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
-
         panel_open()
         section("ROC curve", "True positive rate vs. false positive rate")
         roc_fig = go.Figure()
@@ -897,8 +964,7 @@ def page_insights():
 
     with tab2:
         panel_open()
-        section("Precision / Recall vs. threshold",
-                "Trade-off as you move the decision threshold")
+        section("Precision / Recall vs. threshold", "Trade-off as you move the threshold")
         sweep = DIAG["sweep"]
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=sweep["threshold"], y=sweep["precision"],
@@ -918,7 +984,8 @@ def page_insights():
         st.plotly_chart(style_fig(fig, 380), use_container_width=True)
 
         st.caption(f"At the current threshold of **{THRESHOLD:.2f}**, "
-                   f"**{int((DF['_prob']>=THRESHOLD).sum()):,}** of {len(DF):,} accounts are flagged.")
+                   f"**{int((DF['_prob']>=THRESHOLD).sum()):,}** of {len(DF):,} "
+                   f"accounts are flagged.")
         panel_close()
 
     with tab3:
@@ -928,24 +995,31 @@ def page_insights():
 
         if st.button("Compute importances (may take ~10s)", use_container_width=True):
             with st.spinner("Running permutation importance…"):
-                sub = DF.sample(min(300, len(DF)), random_state=42).copy()
-                X = preprocess(sub, BUNDLE)
-                y = sub["IsStatBarred"].astype(int).values
-                result = permutation_importance(
-                    BUNDLE["model"], X, y,
-                    n_repeats=5, random_state=42, n_jobs=-1, scoring="roc_auc",
-                )
-                feature_names = (
-                    list(BUNDLE["numerical_cols"])
-                    + list(BUNDLE["binary_features"])
-                    + list(BUNDLE["encoder"].get_feature_names_out(BUNDLE["onehot_cols"]))
-                )
-                imp = pd.DataFrame({
-                    "feature": feature_names,
-                    "mean": result.importances_mean,
-                    "std":  result.importances_std,
-                }).sort_values("mean", ascending=False).head(20)
-                st.session_state["importance"] = imp
+                try:
+                    sub = DF.sample(min(300, len(DF)), random_state=42).copy()
+                    X = preprocess(sub, BUNDLE)
+                    y_sub = sub[TARGET_COL]
+                    if y_sub.dtype == object or y_sub.dtype.name == "category":
+                        y_sub = y_sub.map({"N":0,"Y":1,"n":0,"y":1,1:1,0:0,True:1,False:0})
+                    y = y_sub.astype(int).values
+
+                    result = permutation_importance(
+                        BUNDLE["model"], X, y,
+                        n_repeats=5, random_state=42, n_jobs=-1, scoring="roc_auc",
+                    )
+                    feature_names = (
+                        list(BUNDLE["numerical_cols"])
+                        + list(BUNDLE["binary_features"])
+                        + list(BUNDLE["encoder"].get_feature_names_out(BUNDLE["onehot_cols"]))
+                    )
+                    imp = pd.DataFrame({
+                        "feature": feature_names,
+                        "mean": result.importances_mean,
+                        "std":  result.importances_std,
+                    }).sort_values("mean", ascending=False).head(20)
+                    st.session_state["importance"] = imp
+                except Exception as e:
+                    st.error(f"Could not compute importances: {e}")
 
         imp = st.session_state.get("importance")
         if imp is not None:
@@ -963,8 +1037,7 @@ def page_insights():
 
     with tab4:
         panel_open()
-        section("Confusion matrix",
-                f"Evaluated at threshold {THRESHOLD:.2f} on the sample")
+        section("Confusion matrix", f"Evaluated at threshold {THRESHOLD:.2f} on the sample")
         cm = DIAG["cm"]
         fig = go.Figure(go.Heatmap(
             z=cm,
@@ -990,14 +1063,18 @@ def page_insights():
 # PAGE — SETTINGS
 # ─────────────────────────────────────────────────────────────────────────────
 def page_settings():
-    hero("Settings & About", "Configuration, model info, and reset options.",
-         "Runtime")
+    hero("Settings & About", "Configuration, model info, and reset options.", "Runtime")
 
     left, right = st.columns([1, 1], gap="large")
 
     with left:
         panel_open()
         section("Runtime configuration", "Values loaded in this session")
+
+        target_line = (f"<span style='color:{GREEN};'>detected</span> "
+                       f"({TARGET_COL})" if HAS_TARGET
+                       else f"<span style='color:{RED};'>not present</span>")
+
         st.markdown(f"""
             <div style="padding:14px;border-radius:12px;background:rgba(120,150,200,.06);
                         border:1px solid {BORDER};margin-bottom:10px;">
@@ -1017,19 +1094,25 @@ def page_settings():
               </div>
             </div>
             <div style="padding:14px;border-radius:12px;background:rgba(120,150,200,.06);
-                        border:1px solid {BORDER};">
+                        border:1px solid {BORDER};margin-bottom:10px;">
               <div style="font-size:11px;text-transform:uppercase;letter-spacing:1.2px;
                           color:{MUTED};">Sample loaded</div>
               <div style="font-size:13.5px;color:{TEXT};">
                 {len(SAMPLE):,} accounts · {len(SAMPLE.columns)} columns
               </div>
             </div>
+            <div style="padding:14px;border-radius:12px;background:rgba(120,150,200,.06);
+                        border:1px solid {BORDER};">
+              <div style="font-size:11px;text-transform:uppercase;letter-spacing:1.2px;
+                          color:{MUTED};">Ground-truth target</div>
+              <div style="font-size:13.5px;color:{TEXT};">{target_line}</div>
+            </div>
         """, unsafe_allow_html=True)
 
         st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
         if st.button("🔄 Re-score portfolio", use_container_width=True):
             for k in list(st.session_state.keys()):
-                if k in ("scored_df", "diag"):
+                if k in ("scored_df", "diag", "diag_error"):
                     del st.session_state[k]
             st.success("Cache cleared. Rebooting…")
             st.rerun()
@@ -1054,8 +1137,7 @@ def page_settings():
           inference time so predictions match training exactly.<br><br>
 
           <b style="color:{TEXT}">Disclaimer:</b> this is a statistical estimate
-          for portfolio prioritisation only — not legal advice. Always confirm
-          limitation periods under the applicable jurisdiction.
+          for portfolio prioritisation only — not legal advice.
         </div>
         """, unsafe_allow_html=True)
         panel_close()
