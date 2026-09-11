@@ -1,6 +1,6 @@
 # app.py — Statute-Barred Debt Predictor
-# Loads statute_barred_model.pkl and runs all inference in-process.
-# Deploy directly on Streamlit Cloud — no backend required.
+# Streamlit frontend. Loads a scikit-learn bundle pickle and renders the dashboard.
+# No TensorFlow, no backend. Runs on Streamlit Cloud Python 3.10–3.14.
 
 from __future__ import annotations
 
@@ -15,10 +15,15 @@ import streamlit as st
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
-BASE       = Path(__file__).parent
-MODEL_PATH = BASE / "statute_barred_model.pkl"
-PREP_PATH  = BASE / "preprocessor.pkl"          # optional fallback
-DATA_PATH  = BASE / "accounts_sample.parquet"
+BASE = Path(__file__).parent
+
+# Model filenames we accept — first one that exists wins
+MODEL_CANDIDATES = [
+    "statute_barred_model.pkl",
+    "statute_barred_model (1).pkl",
+    "statute_barred_model(1).pkl",
+]
+DATA_PATH = BASE / "accounts_sample.parquet"
 
 NAVY_BG  = "#070b16"; PANEL_BG = "#0f1729"; PANEL_2 = "#141d33"
 BORDER   = "rgba(120,150,200,0.18)"
@@ -135,47 +140,51 @@ hr {{border-color:{BORDER}; opacity:.4;}}
 # ─────────────────────────────────────────────────────────────────────────────
 # LOADERS
 # ─────────────────────────────────────────────────────────────────────────────
-@st.cache_resource(show_spinner="Loading model bundle…")
-def load_bundle():
-    """Load statute_barred_model.pkl and detect its shape."""
-    if not MODEL_PATH.exists():
-        st.error(
-            f"**Model file missing:** `{MODEL_PATH.name}`\n\n"
-            "Commit `statute_barred_model.pkl` to the repo root."
-        )
-        st.stop()
-
-    obj = joblib.load(MODEL_PATH)
-
-    # Case 1: dict bundle — {"model": ..., "encoder": ..., "scaler": ...}
-    if isinstance(obj, dict) and "model" in obj:
-        bundle = obj
-        model  = bundle["model"]
-        prep   = bundle          # the dict itself carries prep info
-        return {"model": model, "prep": prep, "kind": "dict_bundle"}
-
-    # Case 2: sklearn Pipeline or bare estimator — preprocessing inside
-    if hasattr(obj, "predict_proba") or hasattr(obj, "predict"):
-        model = obj
-        # Try to load a separate preprocessor if present
-        if PREP_PATH.exists():
-            prep = joblib.load(PREP_PATH)
-        else:
-            prep = None
-        return {"model": model, "prep": prep, "kind": "pipeline"}
-
-    # Case 3: Keras model pickled (unusual)
-    if hasattr(obj, "predict") and hasattr(obj, "save"):
-        model = obj
-        prep = joblib.load(PREP_PATH) if PREP_PATH.exists() else None
-        return {"model": model, "prep": prep, "kind": "keras"}
-
+def _find_model_path() -> Path:
+    for name in MODEL_CANDIDATES:
+        p = BASE / name
+        if p.exists():
+            return p
     st.error(
-        f"**Unrecognized model format:** {type(obj).__name__}\n\n"
-        "Expected either a dict `{'model': ...}`, an sklearn Pipeline, "
-        "or a Keras model."
+        "**Model file not found.** Expected one of:\n\n"
+        + "\n".join(f"- `{n}`" for n in MODEL_CANDIDATES)
+        + "\n\nUpload the pickle to the repo root."
     )
     st.stop()
+
+
+@st.cache_resource(show_spinner="Loading model bundle…")
+def load_bundle():
+    path = _find_model_path()
+    obj = joblib.load(path)
+
+    # Expected: dict with 'model' + preprocessing keys
+    if isinstance(obj, dict) and "model" in obj:
+        required = ["encoder", "scaler", "train_medians",
+                    "onehot_cols", "numerical_cols", "binary_features"]
+        missing = [k for k in required if k not in obj]
+        if missing:
+            st.error(
+                f"**Pickle is missing keys:** {missing}\n\n"
+                "Re-run `train.py` with the export block that saves all "
+                "preprocessing artifacts into the pickle."
+            )
+            st.stop()
+        obj.setdefault("contact_cols", ["NumPhones", "NumEmails", "NumAddresses"])
+        obj.setdefault("threshold", 0.5)
+        return obj
+
+    # Fallback: bare sklearn estimator (assume it handles preprocessing itself)
+    if hasattr(obj, "predict_proba"):
+        return {"model": obj, "kind": "bare_estimator", "threshold": 0.5}
+
+    st.error(
+        f"**Unrecognized pickle contents:** `{type(obj).__name__}`\n\n"
+        "Expected a dict with keys `model`, `encoder`, `scaler`, "
+        "`train_medians`, `onehot_cols`, `numerical_cols`, `binary_features`."
+    )
+    st.stop()
+
 
 @st.cache_data(show_spinner=False)
 def load_sample():
@@ -183,16 +192,15 @@ def load_sample():
         return pd.DataFrame()
     return pd.read_parquet(DATA_PATH)
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-# PREPROCESSING
-# Mirrors train.py exactly when a prep dict is available.
-# If the pickle is a full sklearn Pipeline, we skip straight to predict.
+# PREPROCESSING (mirrors train.py)
 # ─────────────────────────────────────────────────────────────────────────────
-def preprocess(df_raw: pd.DataFrame, prep: dict) -> np.ndarray:
+def preprocess(df_raw: pd.DataFrame, bundle: dict) -> np.ndarray:
     df = df_raw.copy()
 
-    # Feature engineering
-    contact_cols = prep.get("contact_cols", ["NumPhones", "NumEmails", "NumAddresses"])
+    # 1. Feature engineering
+    contact_cols = bundle["contact_cols"]
     if all(c in df.columns for c in contact_cols):
         df["TotalContactInfo"] = df[contact_cols].sum(axis=1)
 
@@ -202,77 +210,56 @@ def preprocess(df_raw: pd.DataFrame, prep: dict) -> np.ndarray:
             df["CurrentBalance"] / denom
         ).replace([np.inf, -np.inf], np.nan).fillna(0)
 
-    # Binary encoding
-    for col in prep.get("binary_features", ["InBankruptcy", "IsLegal"]):
+    # 2. Binary encoding
+    for col in bundle["binary_features"]:
         if col in df.columns:
             df[col] = df[col].map({"N": 0, "Y": 1, 1: 1, 0: 0})
 
-    # EntityID as string
+    # 3. EntityID as string
     if "EntityID" in df.columns:
         df["EntityID"] = df["EntityID"].astype(str)
 
-    # Numerical + scaling
+    # 4. Numerical + scaling
     num = (
-        df[prep["numerical_cols"]]
+        df[bundle["numerical_cols"]]
         .apply(pd.to_numeric, errors="coerce")
-        .fillna(prep["train_medians"])
+        .fillna(bundle["train_medians"])
     )
-    X_num = prep["scaler"].transform(num).astype(np.float32)
+    X_num = bundle["scaler"].transform(num).astype(np.float32)
 
-    # Binary
-    X_bin = df[prep["binary_features"]].to_numpy(dtype=np.float32)
+    # 5. Binary
+    X_bin = df[bundle["binary_features"]].to_numpy(dtype=np.float32)
 
-    # One-hot
-    X_oh = prep["encoder"].transform(df[prep["onehot_cols"]]).astype(np.float32)
+    # 6. One-hot
+    X_oh = bundle["encoder"].transform(df[bundle["onehot_cols"]]).astype(np.float32)
 
     return np.hstack([X_num, X_bin, X_oh]).astype(np.float32)
 
 
 def score_dataframe(df_raw: pd.DataFrame, bundle: dict) -> np.ndarray:
-    """Score a DataFrame using whatever form the pickle takes."""
     if df_raw.empty:
         return np.array([])
 
     model = bundle["model"]
-    prep  = bundle["prep"]
-    kind  = bundle["kind"]
 
-    if kind == "pipeline":
-        # sklearn Pipeline handles preprocessing internally
+    # Bare estimator path — feed raw frame with light coercion
+    if bundle.get("kind") == "bare_estimator":
         X = df_raw.copy()
         if "EntityID" in X.columns:
             X["EntityID"] = X["EntityID"].astype(str)
         for col in ("InBankruptcy", "IsLegal"):
             if col in X.columns:
                 X[col] = X[col].map({"N": 0, "Y": 1, 1: 1, 0: 0})
-        # Feature engineering must match training if the Pipeline expects them
-        if all(c in X.columns for c in ["NumPhones", "NumEmails", "NumAddresses"]):
-            X["TotalContactInfo"] = X[["NumPhones", "NumEmails", "NumAddresses"]].sum(axis=1)
-        if "CurrentBalance" in X.columns and "DebtLoadPrincipal" in X.columns:
-            denom = X["DebtLoadPrincipal"].replace(0, np.nan)
-            X["BalanceToDebtRatio"] = (
-                X["CurrentBalance"] / denom
-            ).replace([np.inf, -np.inf], np.nan).fillna(0)
-        try:
-            probs = model.predict_proba(X)[:, 1]
-        except Exception:
-            # Some Keras-wrapped pickles only expose .predict
-            probs = model.predict(X).ravel()
-        return np.asarray(probs)
+        return np.asarray(model.predict_proba(X)[:, 1])
 
-    # dict_bundle or keras → use the prep dict
-    X = preprocess(df_raw, prep)
-    try:
-        probs = model.predict_proba(X)[:, 1]
-    except AttributeError:
-        probs = model.predict(X, verbose=0).ravel() if hasattr(model, "predict") else model.predict(X)
-        probs = np.asarray(probs).ravel()
-    return np.asarray(probs)
+    X = preprocess(df_raw, bundle)
+    return np.asarray(model.predict_proba(X)[:, 1])
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # UI HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
-def hero(title: str, subtitle: str, badge: str = "Pickle · in-process inference"):
+def hero(title: str, subtitle: str, badge: str = "scikit-learn · in-process inference"):
     st.markdown(f"""
         <div class="hero">
           <div class="hero-content">
@@ -283,6 +270,7 @@ def hero(title: str, subtitle: str, badge: str = "Pickle · in-process inference
         </div>
     """, unsafe_allow_html=True)
 
+
 def metric_card(label, value, hint="", accent=TEAL):
     st.markdown(f"""
         <div class="metric-card" style="--accent:{accent};">
@@ -292,6 +280,7 @@ def metric_card(label, value, hint="", accent=TEAL):
         </div>
     """, unsafe_allow_html=True)
 
+
 def section(title, sub=""):
     st.markdown(
         f'<div class="section-title">{title}</div>'
@@ -299,8 +288,10 @@ def section(title, sub=""):
         unsafe_allow_html=True,
     )
 
+
 def panel_open(): st.markdown('<div class="panel">', unsafe_allow_html=True)
 def panel_close(): st.markdown('</div>', unsafe_allow_html=True)
+
 
 def style_fig(fig, height=340):
     fig.update_layout(
@@ -315,11 +306,13 @@ def style_fig(fig, height=340):
     )
     return fig
 
+
 def prob_color(p):
     if p >= 0.75: return RED
     if p >= 0.50: return AMBER
     if p >= 0.25: return "#eab308"
     return GREEN
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # BOOT
@@ -329,31 +322,25 @@ SAMPLE = load_sample()
 
 if SAMPLE.empty:
     st.error(
-        "**accounts_sample.parquet missing.** Generate it at the end of `train.py`:\n\n"
-        "```python\n"
-        'df["AccountID"] = ["ACC" + str(i).zfill(6) for i in range(len(df))]\n'
-        'sample = df.groupby("IsStatBarred", group_keys=False).apply(\n'
-        '    lambda g: g.sample(min(len(g), 500), random_state=42)\n'
-        ').reset_index(drop=True)\n'
-        'sample.to_parquet("accounts_sample.parquet", index=False)\n'
-        "```"
+        "**`accounts_sample.parquet` missing.** Generate it at the end of "
+        "`train.py` and commit it to the repo root."
     )
     st.stop()
 
-THRESHOLD = BUNDLE["prep"].get("threshold", 0.5) if isinstance(BUNDLE["prep"], dict) else 0.5
+THRESHOLD = float(BUNDLE.get("threshold", 0.5))
 
 # Score the sample once per session
-cache_key = f"scored_{BUNDLE['kind']}_{id(BUNDLE['model'])}_{THRESHOLD}"
+cache_key = f"scored_{id(BUNDLE['model'])}_{THRESHOLD}"
 if cache_key not in st.session_state:
     with st.spinner("Scoring portfolio…"):
         probs = score_dataframe(SAMPLE, BUNDLE)
     df_scored = SAMPLE.copy()
     df_scored["_prob"] = probs
     st.session_state[cache_key] = df_scored
-    st.session_state["_current_threshold"] = THRESHOLD
     st.session_state["_active_cache_key"] = cache_key
 
 DF = st.session_state[st.session_state["_active_cache_key"]].copy()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SIDEBAR
@@ -399,11 +386,12 @@ def sidebar():
         st.markdown(
             f"<div style='color:{GREEN};font-weight:600;font-size:12.5px;'>● Model loaded</div>"
             f"<div style='color:{MUTED};font-size:11px;margin-top:4px;'>"
-            f"{len(SAMPLE):,} accounts · format: {BUNDLE['kind'].replace('_',' ')}</div>",
+            f"{len(SAMPLE):,} accounts · {type(BUNDLE['model']).__name__}</div>",
             unsafe_allow_html=True,
         )
 
         return page, filters
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PAGE — DASHBOARD
@@ -507,6 +495,7 @@ def page_dashboard():
             st.info("No status column in sample.")
         panel_close()
 
+
 # ─────────────────────────────────────────────────────────────────────────────
 # PAGE — EXPLORER
 # ─────────────────────────────────────────────────────────────────────────────
@@ -577,6 +566,7 @@ def page_explorer(filters):
             st.session_state["explorer_page"] = page + 1
             st.rerun()
     panel_close()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PAGE — DETAILS
@@ -694,6 +684,7 @@ def page_details():
         st.dataframe(rec, use_container_width=True, hide_index=True, height=420)
         panel_close()
 
+
 # ─────────────────────────────────────────────────────────────────────────────
 # PAGE — SETTINGS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -727,12 +718,10 @@ def page_settings():
         """, unsafe_allow_html=True)
 
         if st.button("Apply threshold", use_container_width=True):
-            if isinstance(BUNDLE["prep"], dict):
-                BUNDLE["prep"]["threshold"] = new_t
+            BUNDLE["threshold"] = new_t
             for k in list(st.session_state.keys()):
                 if k.startswith("scored_"):
                     del st.session_state[k]
-            st.session_state["_current_threshold"] = new_t
             st.success(f"Threshold set to **{new_t:.2f}**")
             st.rerun()
         panel_close()
@@ -768,11 +757,13 @@ def page_settings():
                           color:{MUTED};margin-bottom:6px;">Model</div>
               <div style="font-size:13.5px;color:{TEXT};">
                 {type(BUNDLE['model']).__name__}<br>
-                <span style="color:{MUTED};font-size:12px;">format: {BUNDLE['kind'].replace('_',' ')}</span>
+                <span style="color:{MUTED};font-size:12px;">
+                  {len(BUNDLE['encoder'].get_feature_names_out())} one-hot features</span>
               </div>
             </div>
         """, unsafe_allow_html=True)
         panel_close()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ROUTER
@@ -789,6 +780,7 @@ def main():
         page_details()
     elif page == "Model & Settings":
         page_settings()
+
 
 if __name__ == "__main__":
     main()
